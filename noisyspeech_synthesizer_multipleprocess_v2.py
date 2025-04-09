@@ -73,6 +73,11 @@ def build_audio(is_clean, params, index, audio_samples_length=-1):
     remaining_length = audio_samples_length
     files_used = []
     clipped_files = []
+    segment_info = {
+        'files': [],    # 存储所有使用的文件路径
+        'starts': [],   # 存储所有起始点
+        'durations': [] # 存储所有持续时间
+    }
 
     if is_clean:
         source_files = params['cleanfilenames']
@@ -103,7 +108,8 @@ def build_audio(is_clean, params, index, audio_samples_length=-1):
 
         idx = (idx + 1) % np.size(source_files)
         #input_audio, fs_input = audioread_with_cache(source_files[idx])
-        process_logger = logging.getLogger(f"Process-{multiprocessing.current_process().pid}")
+        process_idx = params.get('process_idx', 0)
+        process_logger = logging.getLogger(f"Process-{process_idx}")
         process_logger.info(f"Loading audio file: {source_files[idx]}")  # 使用进程专属logger
         input_audio, fs_input = audioread(source_files[idx])
         if input_audio is None:
@@ -121,6 +127,7 @@ def build_audio(is_clean, params, index, audio_samples_length=-1):
             idx_seg = np.random.randint(0, len(input_audio) - segment_len)
             input_segment = input_audio[idx_seg:idx_seg + segment_len]
         else:
+            idx_seg = 0
             input_segment = input_audio[:segment_len]
 
 
@@ -129,6 +136,8 @@ def build_audio(is_clean, params, index, audio_samples_length=-1):
             clipped_files.append(source_files[idx])
             tries_left -= 1
             continue
+
+        files_used.append(source_files[idx])
 
         # 填充预分配数组
         output_audio[current_pos:current_pos+segment_len] = input_segment  # 修改此行
@@ -140,16 +149,20 @@ def build_audio(is_clean, params, index, audio_samples_length=-1):
             output_audio[current_pos:current_pos+silence_len] = silence[:silence_len]
             current_pos += silence_len
             remaining_length -= silence_len
+            
+        # 记录所有片段信息
+        segment_info['files'].append(source_files[idx])
+        segment_info['starts'].append(idx_seg)
+        segment_info['durations'].append(segment_len)
     # 截取实际使用的部分
     output_audio = output_audio[:current_pos]
-    
     
     if tries_left == 0 and not is_clean and 'noisedirs' in params.keys():
         print("There are not enough non-clipped files in the " + noisedirs[idx_n_dir] + \
               " directory to complete the audio build")
-        return [], [], clipped_files, idx
+        return [], [], clipped_files, idx, []
 
-    return output_audio, files_used, clipped_files, idx
+    return output_audio, files_used, clipped_files, idx, segment_info
 
 
 def gen_audio(is_clean, params, index, audio_samples_length=-1):
@@ -158,6 +171,7 @@ def gen_audio(is_clean, params, index, audio_samples_length=-1):
 
     clipped_files = []
     low_activity_files = []
+    segment_info = []
     if audio_samples_length == -1:
         audio_samples_length = int(params['audio_length'] * params['fs'])
     if is_clean:
@@ -166,11 +180,12 @@ def gen_audio(is_clean, params, index, audio_samples_length=-1):
         activity_threshold = params['noise_activity_threshold']
 
     while True:
-        audio, source_files, new_clipped_files, index = \
+        audio, source_files, new_clipped_files, index, segment_info = \
             build_audio(is_clean, params, index, audio_samples_length)
 
         clipped_files += new_clipped_files
         if len(audio) < audio_samples_length:
+            print(f"ERROR: Audio length {len(audio)} < {audio_samples_length} (expected)")
             continue
 
         if activity_threshold == 0.0:
@@ -182,7 +197,7 @@ def gen_audio(is_clean, params, index, audio_samples_length=-1):
         else:
             low_activity_files += source_files
 
-    return audio, source_files, clipped_files, low_activity_files, index
+    return audio, source_files, clipped_files, low_activity_files, index, segment_info
 
 '''
 # 引入多线程并行化
@@ -205,6 +220,7 @@ def process_batch(params, file_num_start, file_num_end, queue):
 
     # 获取当前进程的索引
     process_idx = multiprocessing.current_process()._identity[0] - 1  # 进程索引从0开始
+    params['process_idx'] = process_idx
     # 使用固定种子 + 进程索引的方式
     fixed_seed = 42  # 固定种子
     np.random.seed(fixed_seed + process_idx)
@@ -212,7 +228,8 @@ def process_batch(params, file_num_start, file_num_end, queue):
     
     # 在子进程初始化时创建独立logger
     logger = logging.getLogger(f"Process-{process_idx}")
-    logger.setLevel(logging.INFO)
+    logger.handlers = []  # 清除可能继承的handler
+    
     
     # 创建文件handler时添加进程标识，并保存到log_dir中
     log_dir = params['log_dir']
@@ -221,90 +238,137 @@ def process_batch(params, file_num_start, file_num_end, queue):
     formatter = logging.Formatter('%(asctime)s - %(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
     
-    clean_index = 0
-    noise_index = 0
-    file_num = file_num_start
+    try:
+        clean_index = 0
+        noise_index = 0
+        file_num = file_num_start
 
-    # 将.lst文件保存到log_dir中
-    train_list_file = os.path.join(log_dir, f'train_{file_num_start}_{file_num_end}.lst')
-    with open(train_list_file, 'w') as lst:
-        while file_num <= file_num_end:
+        # 将.lst文件保存到log_dir中
+        train_list_file = os.path.join(log_dir, f'train_{file_num_start}_{file_num_end}.lst')
+            
+        # 修改文件打开部分，添加CSV文件
+        param_log_file = os.path.join(log_dir, f'synthesis_params_{file_num_start}_{file_num_end}.csv')
+        with open(train_list_file, 'w') as lst, open(param_log_file, 'w') as csv_writer:
+            # 写入CSV表头
+            header = [
+                'noisy_file', 'clean_file', 'noise_file', 'rir_file',
+                'clean_start', 'clean_duration', 'noise_start', 'noise_duration',
+                'snr', 'target_level', 't60', 'fs'
+            ]
+            csv_writer.write(','.join(header) + '\n')
+        
+            while file_num <= file_num_end:
 
-            clean, clean_sf, clean_cf, clean_laf, clean_index = \
-                gen_audio(True, params, clean_index)
-                
-            rir_index = random.randint(0, len(params['myrir'])-1)
-            my_rir_path = os.path.join('datasets/impulse_responses', params['myrir'][rir_index])
-            _, samples_rir = wavfile.read(my_rir_path)
+                # 修改 gen_audio 调用部分，获取更多元数据
+                clean, clean_sf, clean_cf, clean_laf, clean_index, clean_segment_info = \
+                    gen_audio(True, params, clean_index)
+                 
+                clean_files = ";".join(clean_segment_info['files'])
+                clean_starts = ";".join(map(str, clean_segment_info['starts']))
+                clean_durations = ";".join(map(str, clean_segment_info['durations']))
+                  
+                rir_index = random.randint(0, len(params['myrir'])-1)
+                my_rir_path = os.path.join('datasets/impulse_responses', params['myrir'][rir_index])
+                _, samples_rir = wavfile.read(my_rir_path)
 
-            # 通道选择逻辑
-            if samples_rir.ndim == 1:
-                samples_rir_ch = samples_rir
-            else:
-                channel_idx = int(params['mychannel'][rir_index]) - 1
-                samples_rir_ch = samples_rir[:, channel_idx]
+                # 通道选择逻辑
+                if samples_rir.ndim == 1:
+                    samples_rir_ch = samples_rir
+                else:
+                    channel_idx = int(params['mychannel'][rir_index]) - 1
+                    samples_rir_ch = samples_rir[:, channel_idx]
 
-            # 应用混响
-            clean = add_pyreverb(clean, samples_rir_ch)
+                # 应用混响
+                clean = add_pyreverb(clean, samples_rir_ch)
 
-            noise, noise_sf, noise_cf, noise_laf, noise_index = \
-                gen_audio(False, params, noise_index, len(clean))
-   
+                noise, noise_sf, noise_cf, noise_laf, noise_index, noise_segment_info = \
+                    gen_audio(False, params, noise_index, len(clean))
+                               
+                noise_files = ";".join(noise_segment_info['files']) 
+                noise_starts = ";".join(map(str, noise_segment_info['starts']))
+                noise_durations = ";".join(map(str, noise_segment_info['durations']))
 
-            clean_clipped_files += clean_cf
-            clean_low_activity_files += clean_laf
-            noise_clipped_files += noise_cf
-            noise_low_activity_files += noise_laf
+                clean_clipped_files += clean_cf
+                clean_low_activity_files += clean_laf
+                noise_clipped_files += noise_cf
+                noise_low_activity_files += noise_laf
 
-            # mix clean speech and noise
-            # if specified, use specified SNR value
-            if not params['randomize_snr']:
-                snr = params['snr']
-            # use a randomly sampled SNR value between the specified bounds
-            else:
-                snr = np.random.randint(params['snr_lower'], params['snr_upper'])
+                # mix clean speech and noise
+                # if specified, use specified SNR value
+                if not params['randomize_snr']:
+                    snr = params['snr']
+                # use a randomly sampled SNR value between the specified bounds
+                else:
+                    snr = np.random.randint(params['snr_lower'], params['snr_upper'])
 
-            # clean_snr, noise_snr, noisy_snr, target_level = snr_mixer(params=params,
-            #                                                           clean=clean,
-            #                                                           noise=noise,
-            #                                                           snr=snr)
-            # Uncomment the below lines if you need segmental SNR and comment the above lines using snr_mixer
-            clean_snr, noise_snr, noisy_snr, target_level = segmental_snr_mixer(params=params,
-                                                                                clean=clean,
-                                                                                noise=noise,
-                                                                                snr=snr)
-            # unexpected clipping
-            if is_clipped(clean_snr) or is_clipped(noise_snr) or is_clipped(noisy_snr):
-                print("Warning: File #" + str(file_num) + " has unexpected clipping, " + \
-                      "returning without writing audio to disk")
-                continue
+                # clean_snr, noise_snr, noisy_snr, target_level = snr_mixer(params=params,
+                #                                                           clean=clean,
+                #                                                           noise=noise,
+                #                                                           snr=snr)
+                # Uncomment the below lines if you need segmental SNR and comment the above lines using snr_mixer
+                clean_snr, noise_snr, noisy_snr, target_level = segmental_snr_mixer(params=params,
+                                                                                    clean=clean,
+                                                                                    noise=noise,
+                                                                                    snr=snr)
+                # unexpected clipping
+                if is_clipped(clean_snr) or is_clipped(noise_snr) or is_clipped(noisy_snr):
+                    print("Warning: File #" + str(file_num) + " has unexpected clipping, " + \
+                        "returning without writing audio to disk")
+                    continue
 
-            clean_source_files += clean_sf
-            noise_source_files += noise_sf
+                clean_source_files += clean_sf
+                noise_source_files += noise_sf
 
-            cleanfilename = 'clean_fileid_'+str(file_num)+'.wav'
-            noisefilename = 'noise_fileid_'+str(file_num)+'.wav'
-            noisyfilename = 'noisy_fileid_'+str(file_num)+ '_snr' + \
-                            str(snr) + '_tl' + str(target_level) + '.wav'
+                cleanfilename = 'clean_fileid_'+str(file_num)+'.wav'
+                noisefilename = 'noise_fileid_'+str(file_num)+'.wav'
+                noisyfilename = 'noisy_fileid_'+str(file_num)+ '_snr' + \
+                                str(snr) + '_tl' + str(target_level) + '.wav'
 
-            noisypath = os.path.join(params['noisyspeech_dir'], noisyfilename)
-            cleanpath = os.path.join(params['clean_proc_dir'], cleanfilename)
-            noisepath = os.path.join(params['noise_proc_dir'], noisefilename)
-            lst.write(' '.join((noisypath, cleanpath, f'{params["audio_length"]}')) + '\n')
+                noisypath = os.path.join(params['noisyspeech_dir'], noisyfilename)
+                cleanpath = os.path.join(params['clean_proc_dir'], cleanfilename)
+                noisepath = os.path.join(params['noise_proc_dir'], noisefilename)
+                lst.write(' '.join((noisypath, cleanpath, f'{params["audio_length"]}')) + '\n')
 
-            audio_signals = [noisy_snr, clean_snr, noise_snr]
-            file_paths = [noisypath, cleanpath, noisepath]
+                audio_signals = [noisy_snr, clean_snr, noise_snr]
+                file_paths = [noisypath, cleanpath, noisepath]
 
-            file_num += 1
-            for i in range(len(audio_signals)):
-                try:
-                    audiowrite(file_paths[i], audio_signals[i], params['fs'])
-                except Exception as e:
-                    print(str(e))
-                    
-    queue.put((clean_source_files, clean_clipped_files, clean_low_activity_files,
-               noise_source_files, noise_clipped_files, noise_low_activity_files))
+                file_num += 1
+                for i in range(len(audio_signals)):
+                    try:
+                        audiowrite(file_paths[i], audio_signals[i], params['fs'])
+                    except Exception as e:
+                        print(str(e))
+                        
+                # 在写入CSV部分添加元数据
+                csv_row = [
+                    noisypath,
+                    clean_files, 
+                    noise_files,
+                    my_rir_path,
+                    clean_starts,
+                    clean_durations,
+                    noise_starts,
+                    noise_durations,
+                        str(snr), str(target_level), 
+                    str(params['myt60'][rir_index]), 
+                    str(params['fs'])
+                ]
+                csv_writer.write(','.join(csv_row) + '\n')
+            
+    except Exception as e:   
+        logger.error(f"Process {process_idx} crashed: {str(e)}", exc_info=True)
+        
+        handler.flush()  # 新增强制刷新缓冲区
+        os.fsync(handler.stream.fileno())  # 强制操作系统级写入
+    finally:
+            
+        # 关键修复：确保在退出前执行以下操作
+        handler.close()          # 关闭文件句柄
+        logger.removeHandler(handler)  # 移除handler防止内存泄漏        
+        queue.put((clean_source_files, clean_clipped_files, clean_low_activity_files,
+                noise_source_files, noise_clipped_files, noise_low_activity_files))
 
 def main_gen(params):
     '''Calls process_batch() in parallel to generate the audio signals'''
@@ -337,6 +401,12 @@ def main_gen(params):
     for p in processes:
         p.join()
 
+        
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+        p.close()
+
     # Collect results from all processes
     clean_source_files = []
     clean_clipped_files = []
@@ -345,8 +415,8 @@ def main_gen(params):
     noise_clipped_files = []
     noise_low_activity_files = []
 
-    while not queue.empty():
-        result = queue.get()
+    for _ in range(num_processes):
+        result = queue.get(block=True)  # 阻塞式获取
         clean_source_files += result[0]
         clean_clipped_files += result[1]
         clean_low_activity_files += result[2]
@@ -665,8 +735,9 @@ def main_body():
     print("Of the " + str(total_noise) + " noise files analyzed, " + str(pct_noise_clipped) + \
           "% had clipping, and " + str(pct_noise_low_activity) + "% had low activity " + \
           "(below " + str(params['noise_activity_threshold'] * 100) + "% active percentage)")
-
+    sys.exit(0)  # 确保主进程退出
 
 if __name__ == '__main__':
     print('num_processes:', num_processes)
     main_body()
+    sys.exit(0)  # 双重保障退出
