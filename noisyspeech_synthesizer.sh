@@ -1,0 +1,7 @@
+#python noisyspeech_synthesizer_singleprocess_multiprocessing.py --cfg noisyspeech_synthesizer_4FRCRN.cfg
+#python noisyspeech_synthesizer_singleprocess_multiprocessing.py --cfg noisyspeech_synthesizer.cfg
+#python noisyspeech_synthesizer_singleprocess_timing.py --cfg noisyspeech_synthesizer.cfg
+#python noisyspeech_synthesizer_singleprocess_multpro.py --cfg noisyspeech_synthesizer.cfg
+#python noisyspeech_synthesizer_singleprocess_multiprocessing_GhatGPT.py --cfg noisyspeech_synthesizer.cfg
+#python noisyspeech_synthesizer_singleprocess_timingtage.py --cfg noisyspeech_synthesizer.cfg
+python noisyspeech_synthesizer_multipleprocess_v2.py --cfg noisyspeech_synthesizer_4FRCRN_multiple.cfg
